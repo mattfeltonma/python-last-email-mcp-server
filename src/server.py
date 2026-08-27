@@ -1,7 +1,6 @@
 # Basic
 import logging
 import os
-import sys
 import requests
 from dotenv import load_dotenv
 
@@ -18,12 +17,8 @@ from starlette.responses import PlainTextResponse
 # Load environmental variables
 load_dotenv(override=True)
 
-# Configure logging
-logger = logging.getLogger("GraphOBOServer")
-logger.setLevel(logging.ERROR)
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-logger.addHandler(_handler)
+# Use Uvicorn's logger so errors appear in its output
+logger = logging.getLogger("uvicorn.error")
 
 # Entra app registration config
 CLIENT_ID = os.getenv("ENTRA_CLIENT_ID")
