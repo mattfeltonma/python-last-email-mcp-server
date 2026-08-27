@@ -148,4 +148,4 @@ def get_last_email(user_assertion: str) -> dict:
     }
 
 if __name__ == "__main__":
-    mcp.run("streamable-http", host="0.0.0.0", port=8080, show_banner="My OBO MCP Server")
+    mcp.run("streamable-http", host="0.0.0.0", port=80, show_banner="My OBO MCP Server")
