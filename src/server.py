@@ -1,6 +1,7 @@
 # Basic
 import logging
 import os
+import sys
 import requests
 from dotenv import load_dotenv
 
@@ -20,7 +21,7 @@ load_dotenv(override=True)
 # Configure logging
 logger = logging.getLogger("GraphOBOServer")
 logger.setLevel(logging.ERROR)
-_handler = logging.StreamHandler()
+_handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
 logger.addHandler(_handler)
 
