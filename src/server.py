@@ -18,11 +18,11 @@ from starlette.responses import PlainTextResponse
 load_dotenv(override=True)
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
 logger = logging.getLogger("GraphOBOServer")
+logger.setLevel(logging.ERROR)
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+logger.addHandler(_handler)
 
 # Entra app registration config
 CLIENT_ID = os.getenv("ENTRA_CLIENT_ID")
