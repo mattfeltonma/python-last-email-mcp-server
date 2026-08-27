@@ -1,147 +1,141 @@
 # Basic
-import logging
+import sys
 import os
-import requests
+import logging
+import contextvars
+import httpx
 from dotenv import load_dotenv
 
-# MSAL for On-Behalf-Of token exchange
 import msal
-
-# FastMCP
 from fastmcp import FastMCP
-
-# Required for health check
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-# Load environmental variables
+## Load environment variables
 load_dotenv(override=True)
 
-# Use Uvicorn's logger so errors appear in its output
-logger = logging.getLogger("uvicorn.error")
+## This variable stores the user's token from the incoming HTTP request
+## so the tool function can access it later. Think of it like a per-request global.
+incoming_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "incoming_token", default=None
+)
 
-# Entra app registration config
+## Entra app registration config
 CLIENT_ID = os.getenv("ENTRA_CLIENT_ID")
 CLIENT_SECRET = os.getenv("ENTRA_CLIENT_SECRET")
 TENANT_ID = os.getenv("ENTRA_TENANT_ID")
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-GRAPH_SCOPE = ["https://graph.microsoft.com/Mail.Read"]
 
-# Build the MSAL confidential client once at startup
-_msal_app = msal.ConfidentialClientApplication(
+## MSAL client — handles the OBO token exchange with Entra
+msal_app = msal.ConfidentialClientApplication(
     client_id=CLIENT_ID,
     client_credential=CLIENT_SECRET,
-    authority=AUTHORITY,
+    authority=f"https://login.microsoftonline.com/{TENANT_ID}",
 )
 
-# Setup MCP server with tool instructions
+
+## Configure logging to stdout so it shows up in the Uvicorn terminal
+def configure_logging(level="ERROR"):
+    try:
+        logging.basicConfig(
+            level=getattr(logging, level.upper()),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[logging.StreamHandler(sys.stdout)]
+        )
+    except Exception as e:
+        print(f"Failed to set up logging: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+## This grabs the Authorization header from every incoming HTTP request
+## and saves the Bearer token so the tool can use it for OBO.
+## MCP tools don't have access to HTTP headers like FastAPI routes do,
+## so this is the workaround.
+class AuthHeaderMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            auth = headers.get(b"authorization", b"").decode()
+            if auth.startswith("Bearer "):
+                incoming_token.set(auth.removeprefix("Bearer "))
+        await self.app(scope, receive, send)
+
+
+## Setup MCP server
 mcp = FastMCP(
     name="GraphOBOServer",
-    instructions="""
-        This server provides one tool: get_last_email.
-        It returns the last email for the signed-in user.
-        The caller must supply a valid user assertion token from the upstream app.
-        Response includes `from`, `to`, `subject`, `date`, and `body` fields.
-    """
+    instructions="This server provides one tool: get_last_email. It returns the last email for the signed-in user."
 )
 
-# Add a health check endpoint
+
 @mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> PlainTextResponse:
     return PlainTextResponse("healthy", status_code=200)
 
 
-def _exchange_obo_token(user_assertion: str) -> str:
-    """Exchange the upstream user assertion for a Graph API access token via OBO flow."""
-    result = _msal_app.acquire_token_on_behalf_of(
-        user_assertion=user_assertion,
-        scopes=GRAPH_SCOPE,
-    )
-    if "access_token" in result:
-        return result["access_token"]
-
-    error_desc = result.get("error_description", result.get("error", "Unknown OBO error"))
-    raise RuntimeError(f"OBO token exchange failed: {error_desc}")
-
-
-# Create the get_last_email tool
 @mcp.tool()
-def get_last_email(user_assertion: str) -> dict:
-    """Get the last email for the signed-in user.
+def get_last_email() -> dict:
+    """Get the last email for the signed-in user."""
 
-    Args:
-        user_assertion: The access token from the upstream application to exchange via OBO flow.
+    ## Get the token that the upstream app sent in the Authorization header
+    user_token = incoming_token.get()
+    if not user_token:
+        logging.error("No Bearer token in Authorization header")
+        return {"error": "No Bearer token in Authorization header"}
 
-    Returns:
-        A JSON object containing:
-        - from: sender of the email
-        - to: recipients of the email
-        - subject: subject of the email
-        - date: date the email was received
-        - body: body content of the email
-    """
+    ## Exchange it for a Graph API token using OBO
+    result = msal_app.acquire_token_on_behalf_of(
+        user_assertion=user_token,
+        scopes=["https://graph.microsoft.com/Mail.Read"],
+    )
+    if "access_token" not in result:
+        error = result.get("error_description", result.get("error", "Unknown error"))
+        logging.error("OBO token exchange failed: %s", error)
+        return {"error": f"OBO token exchange failed: {error}"}
 
-    # Exchange the upstream token for a Graph token via OBO
+    graph_token = result["access_token"]
+
+    ## Call Graph API with the OBO token to get the user's last email
     try:
-        graph_token = _exchange_obo_token(user_assertion)
-    except RuntimeError as e:
-        logger.error("OBO token exchange error: %s", e)
-        return {
-            "error": {
-                "type": "tool_error",
-                "code": "OBO_TOKEN_ERROR",
-                "message": str(e),
-            }
-        }
-
-    # Call Microsoft Graph to get the last email
-    try:
-        result = requests.get(
-            url="https://graph.microsoft.com/v1.0/me/messages",
-            headers={"Authorization": f"Bearer {graph_token}"},
+        response = httpx.get(
+            "https://graph.microsoft.com/v1.0/me/messages",
+            headers={
+                "Authorization": f"Bearer {graph_token}",
+                "Prefer": 'outlook.body-content-type="text"',
+            },
             params={
                 "$top": 1,
-                "$orderby": "receivedDateTime desc",
-                "$select": "from,toRecipients,subject,receivedDateTime,body",
+                "$select": "subject,from,receivedDateTime,bodyPreview",
             },
             timeout=30,
         )
-    except requests.RequestException as e:
-        logger.error("Network error fetching email: %s", e)
-        return {
-            "error": {
-                "type": "tool_error",
-                "code": "GRAPH_NETWORK_ERROR",
-                "message": "Unable to reach Microsoft Graph",
-            }
-        }
+    except httpx.RequestError as e:
+        logging.error("Network error calling Graph: %s", e)
+        return {"error": "Unable to reach Microsoft Graph"}
 
-    if result.status_code != 200:
-        logger.error("Graph API error: %s - %s", result.status_code, result.text)
-        return {
-            "error": {
-                "type": "tool_error",
-                "code": "GRAPH_API_ERROR",
-                "message": f"Graph API returned {result.status_code}",
-            }
-        }
+    if response.status_code != 200:
+        logging.error("Graph API error: %s", response.status_code)
+        return {"error": f"Graph API returned {response.status_code}"}
 
-    data = result.json()
-    messages = data.get("value", [])
+    messages = response.json().get("value", [])
     if not messages:
         return {"message": "No emails found"}
 
     msg = messages[0]
     return {
         "from": msg.get("from", {}).get("emailAddress", {}).get("address", ""),
-        "to": [
-            r.get("emailAddress", {}).get("address", "")
-            for r in msg.get("toRecipients", [])
-        ],
         "subject": msg.get("subject", ""),
         "date": msg.get("receivedDateTime", ""),
-        "body": msg.get("body", {}).get("content", ""),
+        "bodyPreview": msg.get("bodyPreview", ""),
     }
 
+
 if __name__ == "__main__":
-    mcp.run("streamable-http", host="0.0.0.0", port=80, show_banner="My OBO MCP Server")
+    import uvicorn
+    configure_logging(level="INFO")
+    app = mcp.http_app()
+    app = AuthHeaderMiddleware(app)
+    uvicorn.run(app, host="0.0.0.0", port=80)
