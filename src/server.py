@@ -1,4 +1,5 @@
 # Basic
+import logging
 import os
 import requests
 from dotenv import load_dotenv
@@ -15,6 +16,13 @@ from starlette.responses import PlainTextResponse
 
 # Load environmental variables
 load_dotenv(override=True)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("GraphOBOServer")
 
 # Entra app registration config
 CLIENT_ID = os.getenv("ENTRA_CLIENT_ID")
@@ -81,7 +89,7 @@ def get_last_email(user_assertion: str) -> dict:
     try:
         graph_token = _exchange_obo_token(user_assertion)
     except RuntimeError as e:
-        print(f"OBO token exchange error: {e}")
+        logger.error("OBO token exchange error: %s", e)
         return {
             "error": {
                 "type": "tool_error",
@@ -103,7 +111,7 @@ def get_last_email(user_assertion: str) -> dict:
             timeout=30,
         )
     except requests.RequestException as e:
-        print(f"Network error fetching email: {e}")
+        logger.error("Network error fetching email: %s", e)
         return {
             "error": {
                 "type": "tool_error",
@@ -113,7 +121,7 @@ def get_last_email(user_assertion: str) -> dict:
         }
 
     if result.status_code != 200:
-        print(f"Graph API error: {result.status_code} - {result.text}")
+        logger.error("Graph API error: %s - %s", result.status_code, result.text)
         return {
             "error": {
                 "type": "tool_error",
