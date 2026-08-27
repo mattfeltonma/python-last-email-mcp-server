@@ -1,1 +1,1 @@
-# python-fast-api-last-email
+# python-last-email-mcp-server
